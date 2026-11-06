@@ -1,0 +1,9 @@
+# Gitleaks fingerprints for reviewed findings. Each entry must reference the
+# rule it suppresses and stay scoped to one commit/file/line.
+#
+# Format:
+#   <commit>:<file>:<rule-id>:<line>
+#
+# Only add fingerprints after confirming the match is an intentional public
+# value (e.g. anon/publishable keys, documented placeholders) — never to hide
+# a real secret. Prefer rotating and removing the secret over ignoring it.

@@ -1,0 +1,39 @@
+# Drop this job into a deploy / release workflow so security gates deploys.
+# Copy security.yml into .github/workflows/ first.
+#
+# Single-app (default Dockerfile at repo root):
+#
+#   security:
+#     uses: ./.github/workflows/security.yml
+#     permissions:
+#       contents: read
+#       actions: read
+#
+# Monorepo / multi-app — scan one image (repeat jobs or matrix as needed):
+#
+#   security:
+#     uses: ./.github/workflows/security.yml
+#     with:
+#       docker_context: apps/api
+#       dockerfile: apps/api/Dockerfile
+#       image_ref: api:security-scan
+#       codeql_languages: javascript-typescript,python
+#     permissions:
+#       contents: read
+#       actions: read
+#
+# No container (library, docs site, non-Docker deploy):
+#
+#   security:
+#     uses: ./.github/workflows/security.yml
+#     with:
+#       scan_container: false
+#     permissions:
+#       contents: read
+#       actions: read
+#
+# Then require it before deploy:
+#
+#   deploy:
+#     needs: [quality, security]
+#     ...

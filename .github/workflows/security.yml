@@ -1,0 +1,157 @@
+name: Security scanning
+
+# Standalone on pull requests (cheap secret scan only). Callable from a deploy
+# or release workflow where every scan below must pass before deploy starts.
+# Steps are ordered cheapest-first so a finding stops the job before expensive
+# steps run.
+#
+# Works for a single app, multi-app repo, or monorepo: point docker_context /
+# dockerfile at the image you want scanned, or set scan_container=false when
+# there is no container to build.
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+    inputs:
+      codeql_languages:
+        description: >-
+          CodeQL language pack(s), comma-separated
+          (e.g. javascript-typescript, python, go, java-kotlin).
+        type: string
+        default: javascript-typescript
+      scan_container:
+        description: Build a container image and run Trivy against it.
+        type: boolean
+        default: true
+      docker_context:
+        description: Docker build context path (repo-relative).
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile path relative to the repository root.
+        type: string
+        default: Dockerfile
+      image_ref:
+        description: Local tag applied to the image built for Trivy.
+        type: string
+        default: app:security-scan
+      trivy_severity:
+        description: Comma-separated Trivy severities that fail the job.
+        type: string
+        default: HIGH,CRITICAL
+      gitleaks_version:
+        description: Gitleaks release version to download and verify.
+        type: string
+        default: "8.30.1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: security-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read # CodeQL reads the workflow run for status reporting
+    env:
+      GITLEAKS_VERSION: ${{ inputs.gitleaks_version || '8.30.1' }}
+      CODEQL_LANGUAGES: ${{ inputs.codeql_languages || 'javascript-typescript' }}
+      SCAN_CONTAINER: ${{ inputs.scan_container == false && 'false' || 'true' }}
+      DOCKER_CONTEXT: ${{ inputs.docker_context || '.' }}
+      DOCKERFILE: ${{ inputs.dockerfile || 'Dockerfile' }}
+      IMAGE_REF: ${{ inputs.image_ref || 'app:security-scan' }}
+      TRIVY_SEVERITY: ${{ inputs.trivy_severity || 'HIGH,CRITICAL' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      # Runs for every event, including PRs: it costs about a minute.
+      - name: Scan git history for leaked secrets
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl --fail --silent --show-error --location -o "$workdir/$asset" "$base/$asset"
+          curl --fail --silent --show-error --location -o "$workdir/checksums.txt" \
+            "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          (cd "$workdir" && grep " $asset$" checksums.txt | sha256sum --check --strict)
+          tar -xzf "$workdir/$asset" -C "$workdir" gitleaks
+          "$workdir/gitleaks" git --redact --verbose .
+
+      # Everything below is skipped on PRs to keep per-PR minutes minimal; it
+      # runs on deployment pushes and manual dispatches, where it gates deploys.
+      - name: Initialize CodeQL
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ env.CODEQL_LANGUAGES }}
+
+      - name: Analyze with CodeQL
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          output: sarif-results
+          # Repositories without GitHub Advanced Security cannot upload to the
+          # code scanning API; gate on the SARIF locally instead.
+          upload: false
+
+      - name: Fail on error-level CodeQL findings
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          # SARIF omits level for results that default to "error". Findings are
+          # printed to the job log for triage; there is no artifact upload.
+          report="$(find sarif-results -name '*.sarif' -print0 \
+            | xargs -0 jq -r \
+              '.runs[]?.results[]? | select((.level // "error") == "error")
+               | "\(.ruleId)  \(.message.text)  (\(.locations[0].physicalLocation.artifactLocation.uri // "?"):\(.locations[0].physicalLocation.region.startLine // "?"))"' \
+            || true)"
+          count="$(printf '%s\n' "$report" | grep -c . || true)"
+          if [ "$count" -gt 0 ]; then
+            echo "::error::CodeQL reported $count error-level finding(s); triage them below."
+            printf '%s\n' "$report"
+            exit 1
+          fi
+          echo "CodeQL reported no error-level findings."
+
+      - name: Set up Docker Buildx
+        if: >-
+          github.event_name != 'pull_request' &&
+          env.SCAN_CONTAINER == 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # CUSTOMIZE: if the Dockerfile needs build-time secrets or args, add
+      # --secret / --build-arg here (and matching job env / secrets). Placeholder
+      # values are fine when the image only needs to exist for Trivy.
+      - name: Build container image for scanning
+        if: >-
+          github.event_name != 'pull_request' &&
+          env.SCAN_CONTAINER == 'true'
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --load \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --file "${DOCKERFILE}" \
+            --tag "${IMAGE_REF}" \
+            "${DOCKER_CONTEXT}"
+
+      - name: Scan container image for vulnerabilities
+        if: >-
+          github.event_name != 'pull_request' &&
+          env.SCAN_CONTAINER == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          scanners: vuln
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          exit-code: 1
+          format: table
